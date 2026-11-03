@@ -1,7 +1,12 @@
-"""Pipeline orchestrator: router -> detectors -> scoring -> report."""
+"""Pipeline orchestration: Router -> Detectors -> Scoring -> Report.
+
+The pipeline is pure Python (no I/O beyond reading routed files); CLI and the
+GitHub Action are thin wrappers around :func:`ScanPipeline.scan`.
+"""
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -10,64 +15,108 @@ from .config import Config, load_config
 from .detectors.ast_detector import AstDetector
 from .detectors.provenance_detector import ProvenanceDetector
 from .detectors.semantic_detector import SemanticDetector
-from .llm.ollama_client import build_checker
-from .models import Finding, Severity
-from .router import RoutedFile, collect_files, git_changed_files, route_paths
-from .scoring import consensus_score, filter_by_threshold
+from .llm.ollama_client import ApiExistenceChecker, build_checker
+from .models import Finding
+from .router import RoutedFile, RouterError, collect_files, git_changed_files, route_paths
+from .scoring import consensus_score, filter_by_threshold, summary_lines
+
+log = logging.getLogger("slop_guard.pipeline")
+
+#: bundled offline API snapshots shipped with the package
+DEFAULT_SNAPSHOT_DIR = Path(__file__).resolve().parent / "api_snapshots"
 
 
 @dataclass
 class ScanResult:
-    findings: list[Finding] = field(default_factory=list)
+    findings: list[Finding]
     scanned_files: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
-    def count(self, severity: Optional[Severity] = None) -> int:
-        return len([f for f in self.findings if severity is None or f.severity == severity])
+    @property
+    def counts(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for f in self.findings:
+            out[f.severity.value] = out.get(f.severity.value, 0) + 1
+        return out
 
-    def exceeds(self, fail_on: str) -> bool:
-        threshold = Severity(fail_on)
-        return any(f.severity.rank >= threshold.rank for f in self.findings)
 
+class ScanPipeline:
+    def __init__(self, config: Optional[Config] = None, root: Path = Path("."),
+                 checkers: Optional[list[ApiExistenceChecker]] = None):
+        self.config = config or load_config(root=root)
+        self.root = Path(root)
+        self.ast = AstDetector(self.config.ast)
+        self.provenance = ProvenanceDetector(self.config.provenance)
+        if checkers is not None:
+            self._checkers: list[ApiExistenceChecker] = checkers
+        elif self.config.semantic.enabled:
+            self._checkers = build_checker(
+                self.config.semantic.base_url,
+                self.config.semantic.model,
+                self.config.semantic.timeout,
+                self.config.semantic.known_apis_dir or str(DEFAULT_SNAPSHOT_DIR),
+                probe_timeout=self.config.semantic.probe_timeout,
+                cache_dir=self.config.semantic.cache_dir,
+            )
+        else:
+            self._checkers = []
+        if self.config.semantic.enabled and not self._checkers:
+            log.warning("semantic detector enabled but no checker backend is "
+                        "available — semantic findings will be skipped")
+        self.semantic = SemanticDetector(self.config.semantic, self._checkers)
 
-def scan(
-    target: Path,
-    config: Optional[Config] = None,
-    config_path: Optional[str] = None,
-    pr_mode: bool = False,
-    base_ref: str = "origin/main",
-) -> ScanResult:
-    cfg = config or load_config(config_path, root=Path(target))
-    result = ScanResult()
+    # -- routing ---------------------------------------------------------------
 
-    if pr_mode:
-        paths = git_changed_files(Path(target), base_ref) or collect_files(Path(target))
-    else:
-        paths = collect_files(Path(target))
-    routed: list[RoutedFile] = route_paths(paths, cfg.languages, cfg.is_excluded)
-    result.scanned_files = [str(r.path) for r in routed]
+    def _route(self, paths: list[Path]) -> list[RoutedFile]:
+        excl = lambda p: self.config.is_excluded(p, root=self.root)  # noqa: E731
+        return route_paths(paths, self.config.languages, excl, root=self.root)
 
-    detectors: list = []
-    if cfg.ast.enabled:
-        detectors.append(AstDetector(cfg.ast))
-    semantic: Optional[SemanticDetector] = None
-    if cfg.semantic.enabled:
-        checkers = build_checker(
-            cfg.semantic.base_url, cfg.semantic.model,
-            cfg.semantic.timeout,
-            cfg.semantic.known_apis_dir or str(Path(__file__).parent / "api_snapshots"),
-        )
-        semantic = SemanticDetector(cfg.semantic, checkers)
-        if checkers:
-            detectors.append(semantic)
-    if cfg.provenance.enabled:
-        detectors.append(ProvenanceDetector(cfg.provenance))
+    def plan(self, target: Path, pr_mode: bool = False,
+             base_ref: str = "origin/main") -> list[RoutedFile]:
+        """Resolve which files would be scanned (shared by scan & PR mode).
 
-    findings: list[Finding] = []
-    for rf in routed:
-        source = rf.source
-        for det in detectors:
-            # provenance also inspects markdown docs; AST/semantic skip unsupported langs internally
-            findings.extend(det.detect(rf.path, rf.language, source))
+        Raises :class:`RouterError` in PR mode when the diff cannot be
+        computed or is empty — callers must surface that as a hard failure
+        (exit 2), never silently fall back to a full scan.
+        """
+        if pr_mode:
+            changed = git_changed_files(self.root, base_ref)
+            routed = self._route(changed)
+            log.info("PR mode: %d changed file(s), %d scannable", len(changed), len(routed))
+            return routed
+        collected = collect_files(target)
+        routed = self._route(collected)
+        log.debug("collected %d file(s), %d routed", len(collected), len(routed))
+        return routed
 
-    result.findings = filter_by_threshold(consensus_score(findings), 0.5)
-    return result
+    # -- scanning ----------------------------------------------------------------
+
+    def scan(self, target: Path, pr_mode: bool = False,
+             base_ref: str = "origin/main") -> ScanResult:
+        routed = self.plan(target, pr_mode, base_ref)
+        findings: list[Finding] = []
+        errors: list[str] = []
+        scanned: list[str] = []
+
+        for rf in routed:
+            try:
+                source = rf.source
+            except OSError as exc:
+                errors.append(f"{rf.path}: cannot read ({exc})")
+                log.warning("cannot read %s (%s)", rf.path, exc)
+                continue
+            scanned.append(str(rf.path))
+            if not rf.provenance_only:
+                findings.extend(self.ast.detect(rf.path, rf.language, source))
+                findings.extend(self.semantic.detect(rf.path, rf.language, source))
+            findings.extend(self.provenance.detect(rf.path, rf.language, source))
+
+        scored = consensus_score(findings)
+        # global floor from config (was hard-coded 0.5 in earlier revisions)
+        kept = filter_by_threshold(scored, self.config.min_confidence)
+        dropped = len(scored) - len(kept)
+        if dropped:
+            log.info("%d finding(s) below min_confidence=%.2f suppressed",
+                     dropped, self.config.min_confidence)
+        log.info("%s", summary_lines(len(scanned), kept, scanned))
+        return ScanResult(findings=kept, scanned_files=scanned, errors=errors)

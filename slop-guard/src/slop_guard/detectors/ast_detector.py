@@ -4,18 +4,27 @@ Finds structural AI-slop patterns:
 * SG-AST-001 stub functions (TODO + empty/trivial body)
 * SG-AST-002 dead imports (never referenced in the same file)
 * SG-AST-003 noise comments that restate the adjacent line ("# increment i by 1")
-* SG-AST-004 duplicated code blocks (local MinHash clone detector)
+* SG-AST-004 duplicated code blocks (local MinHash *vector* clone detector)
+
+Notes on this revision:
+* Markdown is explicitly not analysed here — the router sends ``.md`` files
+  only to the provenance detector (license texts/tables are "duplicates").
+* The clone detector keeps the full 64-slot minhash vector per window and
+  compares pairs by slot agreement (the old single-hash collapse made
+  ``duplicate_similarity`` dead code: only exact duplicates matched).
+* Dead-import analysis honours ``__all__`` re-exports and string annotations.
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import struct
 from pathlib import Path
 from typing import Iterable, Optional
 
-import tree_sitter_language_pack as tslp
+import tree_sitter_python as tspython
 from tree_sitter import Language, Node, Parser
 
 from ..config import AstConfig
@@ -30,6 +39,8 @@ from ..models import (
     normalize_comment,
 )
 
+log = logging.getLogger("slop_guard.ast")
+
 # ---------------------------------------------------------------------------
 # language helpers
 # ---------------------------------------------------------------------------
@@ -38,11 +49,29 @@ _LANG_CACHE: dict[str, Language] = {}
 
 
 def get_language(name: str) -> Optional[Language]:
-    if name not in _LANG_CACHE:
+    """Return a tree-sitter Language for *name*.
+
+    Python uses the dedicated ``tree-sitter-python`` grammar (the minimal
+    default; other grammars can be plugged in via tree-sitter-language-pack
+    when installed). Non-Python languages are currently not analysed by this
+    detector, so unknown names simply return ``None``.
+    """
+    if name in _LANG_CACHE:
+        return _LANG_CACHE[name]
+    lang: Optional[Language] = None
+    if name == "python":
         try:
-            _LANG_CACHE[name] = tslp.get_language(name)
+            lang = Language(tspython.language())
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("tree-sitter-python unavailable: %s", exc)
+            lang = None
+    else:
+        try:  # optional extra grammars (only used if language-pack is present)
+            import tree_sitter_language_pack as tslp
+            lang = tslp.get_language(name)
         except Exception:
-            return None
+            lang = None
+    _LANG_CACHE[name] = lang if lang is not None else None
     return _LANG_CACHE[name]
 
 
@@ -67,11 +96,30 @@ _COMMENT_FILLER = {
     "line", "code", "next", "then", "here", "below", "above", "creates",
     "create", "initializes", "initialize", "defines", "define", "sets", "set",
     "gets", "get", "calls", "call", "returns", "return", "prints", "print",
-    "adds", "add", "increments", "increment", "decrements", "decrement",
-    "loops", "loop", "iterates", "iterate", "checks", "check", "makes", "make",
-    "used", "use", "using", "to", "for", "of", "in", "on", "by", "and", "or",
-    "is", "are", "be", "will", "would", "with", "from", "as", "new",
+    "converts", "convert", "checks", "check", "makes", "make", "adds", "add",
+    "increments", "increment", "decrements", "decrement", "loops", "loop",
+    "iterates", "iterate", "over", "for", "to", "of", "in", "by", "and", "with",
+    "uses", "use", "new", "same", "just", "simply", "first", "each", "all",
 }
+
+#: Per-file ignore pragmas: ``# slop-guard: ignore[SG-AST-002]`` or bare
+#: ``# slop-guard: ignore`` disables rules for the whole file (dogfooding
+#: fixtures/tests need re-exported symbols on purpose).
+_PERFILE_IGNORE_RE = re.compile(
+    r"#\s*slop-guard:\s*ignore(?:\[(SG-[A-Z]+-\d+(?:,\s*SG-[A-Z]-\d+)*?)\])?",
+    re.I,
+)
+
+
+def _perfile_ignored_rules(source: str) -> Optional[set[str]]:
+    """None = nothing ignored; empty set = everything ignored."""
+    m = _PERFILE_IGNORE_RE.search(source)
+    if not m:
+        return None
+    codes = m.group(1)
+    if not codes:
+        return set()          # bare ignore -> all AST rules off for this file
+    return {c.strip().upper() for c in codes.split(",")}
 
 
 class AstDetector:
@@ -83,264 +131,342 @@ class AstDetector:
     # -- public API ---------------------------------------------------------
 
     def detect(self, path: Path, language: str, source: str) -> list[Finding]:
+        if not self.config.enabled or language != "python":
+            return []
         parsed = parse(language, source)
         if parsed is None:
             return []
         _, src_bytes, root = parsed
+
+        ignored = _perfile_ignored_rules(source)
         findings: list[Finding] = []
-        cfg = self.config
-        if cfg.stub_threshold >= 0:
-            findings += self._stub_functions(root, src_bytes, path)
-        if cfg.dead_imports:
-            findings += self._dead_imports(root, src_bytes, path, language)
-        if cfg.noise_comments:
-            findings += self._noise_comments(root, src_bytes, path)
-        if cfg.duplicate_blocks:
-            findings += self._duplicate_blocks(source, path)
+        checks: list[tuple[str, list[Finding]]] = []
+        if self.config.dead_imports:
+            checks.append((RULE_DEAD_IMPORT, self._dead_imports(root, src_bytes, path, source)))
+        if self.config.noise_comments:
+            checks.append((RULE_NOISE_COMMENT, self._noise_comments(root, src_bytes, path)))
+        if self.config.stub_threshold >= 0:
+            checks.append((RULE_STUB_FUNCTION, self._stub_functions(root, src_bytes, path)))
+        if self.config.duplicate_blocks:
+            checks.append((RULE_DUPLICATED_BLOCK, self._duplicated_blocks(path, source)))
+        for rule, fs in checks:
+            if ignored is not None and rule in ignored:
+                continue
+            findings.extend(fs)
         return findings
 
-    # -- SG-AST-001: stub functions ----------------------------------------
+    # -- SG-AST-002 dead imports ---------------------------------------------
 
-    def _node_text(self, node: Node, src: bytes) -> str:
-        return src[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
-
-    def _stub_functions(self, root: Node, src: bytes, path: Path) -> list[Finding]:
-        out: list[Finding] = []
-        for fn in self._walk(root):
-            if fn.type not in ("function_definition", "function_declaration",
-                               "method_definition", "arrow_function"):
-                continue
-            body = fn.child_by_field_name("body")
-            if body is None:
-                body = next((c for c in fn.children if c.type in ("body", "block", "statement_block")), None)
-            if body is None:
-                continue
-            # statements inside the body (comments excluded automatically)
-            stmts = [c for c in body.children
-                     if c.is_named and c.type != "comment"]
-            body_text = self._node_text(body, src)
-            trivial_stmts = bool(stmts) and all(
-                self._node_text(s, src).strip() in TRIVIAL_BODIES or s.type == "pass_statement"
-                for s in stmts
-            )
-            text_trivial = body_text.strip().rstrip(":").strip("{}").strip() in TRIVIAL_BODIES
-            if not (trivial_stmts or text_trivial):
-                continue
-            # TODO marker: any comment inside the function, preceding comments,
-            # or a docstring mentioning it
-            has_todo = False
-            prev = fn.prev_sibling
-            while prev is not None and prev.type == "comment":
-                if STUB_TODO_RE.search(self._node_text(prev, src)):
-                    has_todo = True
-                    break
-                prev = prev.prev_sibling
-            if not has_todo:
-                for c in self._walk(fn):
-                    if c.type in ("comment", "string"):
-                        if STUB_TODO_RE.search(self._node_text(c, src)):
-                            has_todo = True
-                            break
-            eff_lines = [l for l in body_text.splitlines() if l.strip()]
-            short_body = len(eff_lines) <= max(1, self.config.stub_threshold)
-            if has_todo and short_body:
-                out.append(
-                    Finding(
-                        rule_id=RULE_STUB_FUNCTION,
-                        message=f"Stub function `{self._fn_name(fn, src)}` has no real implementation (TODO placeholder).",
-                        file=str(path),
-                        line=fn.start_point[0] + 1,
-                        column=fn.start_point[1] + 1,
-                        end_line=fn.end_point[0] + 1,
-                        severity=Severity.WARNING,
-                        confidence=0.9,
-                        suggested_fix="Implement the function or remove it until needed.",
-                        detector=self.name,
-                    )
-                )
-        return out
-
-    def _fn_name(self, fn: Node, src: bytes) -> str:
-        name_node = fn.child_by_field_name("name")
-        if name_node is not None:
-            return self._node_text(name_node, src)
-        parent = fn.parent
-        if parent is not None and parent.type == "variable_declarator":
-            n = parent.child_by_field_name("name")
-            if n is not None:
-                return self._node_text(n, src)
-        return "<anonymous>"
-
-    # -- SG-AST-002: dead imports --------------------------------------------
-
-    def _dead_imports(self, root: Node, src: bytes, path: Path, language: str) -> list[Finding]:
-        if language != "python":
+    def _dead_imports(self, root: Node, src: bytes, path: Path, source: str) -> list[Finding]:
+        bound: dict[str, Node] = {}
+        self._collect_imports(root, src, bound)
+        if not bound:
             return []
-        # (bound_name, node_to_report) — we report the *binding* node so that
-        # `from pathlib import Path` flags `Path`, not the word `pathlib`.
-        imported: list[tuple[str, Node]] = []
-        for stmt in root.children:
-            if stmt.type == "import_statement":
-                for alias in stmt.children:
-                    if alias.type == "dotted_name":
-                        # `import x.y` binds the top-level name `x`
-                        imported.append((self._node_text(alias, src).split(".")[0], alias))
-                    elif alias.type == "aliased_import":
-                        name_n = alias.child_by_field_name("name")
-                        alias_n = alias.child_by_field_name("alias")
-                        full = self._node_text(name_n, src) if name_n else ""
-                        bound = (self._node_text(alias_n, src) if alias_n
-                                 else full.split(".")[0])
-                        imported.append((bound, alias))
-            elif stmt.type == "import_from_statement":
-                rel = self._node_text(stmt, src)
-                if "*" in rel:
-                    continue  # star imports bind unknown names; never flag
-                module_n = stmt.child_by_field_name("module_name")
-                for part in stmt.children:
-                    if part.type == "dotted_name" and (
-                        module_n is not None
-                        and part.start_byte > module_n.end_byte
-                    ):
-                        imported.append((self._node_text(part, src), part))
-                    elif part.type == "aliased_import":
-                        alias_n = part.child_by_field_name("alias")
-                        name_n = part.child_by_field_name("name")
-                        imported.append(
-                            (self._node_text(alias_n or name_n, src), part))
 
-        used_names = self._all_identifiers(root, src)
+        used: set[str] = set()
+        for node in self._walk(root):
+            if node.type == "identifier":
+                parent = node.parent
+                # skip the binding occurrences themselves
+                if parent is not None and parent.type in (
+                    "import_statement", "import_from_statement", "aliased_import",
+                    "dotted_name",
+                ):
+                    continue
+                used.add(src[node.start_byte:node.end_byte].decode(errors="replace"))
+
+        # Re-export support: names listed in `__all__` (as strings) are used.
+        exported = self._dunder_all_names(root, src)
+        # String annotations / doctests: any identifier appearing inside a
+        # string literal counts as potentially-used (conservative, kills the
+        # biggest FP class: `def f(x: "Thing")`).
+        in_strings = set()
+        for node in self._walk(root):
+            if node.type in ("string",):
+                text = src[node.start_byte:node.end_byte].decode(errors="replace")
+                in_strings.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text))
+
         findings: list[Finding] = []
-        reported_nodes: set[int] = set()
-        for bound, node in imported:
-            key = id(node)
-            if key in reported_nodes:
+        for name, node in sorted(bound.items(), key=lambda kv: kv[1].start_byte):
+            if name in used or name in exported or name in in_strings:
                 continue
-            if bound in used_names or bound == "__future__":
-                continue
-            reported_nodes.add(key)
             findings.append(
                 Finding(
                     rule_id=RULE_DEAD_IMPORT,
-                    message=f"Imported name `{bound}` is never used in this file.",
+                    message=f"Import `{name}` is never used in this file.",
                     file=str(path),
                     line=node.start_point[0] + 1,
                     column=node.start_point[1] + 1,
                     end_line=node.end_point[0] + 1,
                     severity=Severity.WARNING,
                     confidence=0.95,
-                    suggested_fix=f"Remove the unused import `{bound}`.",
+                    suggested_fix=f"Remove the unused import `{name}`.",
                     detector=self.name,
                 )
             )
         return findings
 
-    def _all_identifiers(self, root: Node, src: bytes) -> set[str]:
-        names: set[str] = set()
-        import_nodes = ("import_statement", "import_from_statement")
-        for n in self._walk(root):
-            if n.type == "identifier":
-                # skip identifiers that are part of the import statement itself
-                p = n.parent
-                in_import = False
-                while p is not None:
-                    if p.type in import_nodes:
-                        in_import = True
-                        break
-                    p = p.parent
-                if not in_import:
-                    names.add(src[n.start_byte:n.end_byte].decode())
-        return names
+    @staticmethod
+    def _dunder_all_names(root: Node, src: bytes) -> set[str]:
+        out: set[str] = set()
+        for node in AstDetector._walk(root):
+            if node.type != "expression_statement":
+                continue
+            child = node.children[0] if node.children else None
+            if child is None or child.type != "assignment":
+                continue
+            left = child.child_by_field_name("left")
+            right = child.child_by_field_name("right")
+            if left is None or right is None:
+                continue
+            if src[left.start_byte:left.end_byte].decode(errors="replace") != "__all__":
+                continue
+            for s in AstDetector._walk(right):
+                if s.type == "string":
+                    val = src[s.start_byte:s.end_byte].decode(errors="replace")
+                    out.add(val.strip("\"'"))
+        return out
 
-    # -- SG-AST-003: noise comments ------------------------------------------
+    @staticmethod
+    def _collect_imports(node: Node, src: bytes, out: dict[str, Node]) -> None:
+        """Map every top-level *binding* introduced by an import statement.
+
+        Handles ``import a.b`` (binds ``a``), ``import a.b as x`` (binds
+        ``x``), ``from m import n [as o]``, parenthesised lists and star
+        imports (which disable dead-import reasoning for the file).
+        """
+        for stmt in node.children:
+            t = stmt.type
+            if t == "import_statement":
+                for child in stmt.children:
+                    AstDetector._bind_import_name(child, src, out)
+            elif t == "import_from_statement":
+                module = stmt.child_by_field_name("module_name")
+                for part in stmt.children:
+                    if part.type == "wildcard_import":
+                        return          # `from x import *` -> cannot reason
+                    if module is not None and part.start_byte <= module.end_byte:
+                        continue        # skip the dotted module path itself
+                    if part.type == "dotted_name":
+                        nm = src[part.start_byte:part.end_byte].decode(errors="replace")
+                        out.setdefault(nm, part)
+                    elif part.type == "aliased_import":
+                        alias = part.child_by_field_name("alias")
+                        target = alias if alias is not None else \
+                            part.child_by_field_name("name")
+                        if target is not None:
+                            nm = src[target.start_byte:target.end_byte].decode(errors="replace")
+                            out.setdefault(nm, part)
+                    elif part.type in ("parenthesized_form", "argument_list"):
+                        AstDetector._collect_from_parens(part, src, out)
+            elif t == "future_import_statement":
+                continue  # __future__ imports are consumed by the interpreter
+
+    @staticmethod
+    def _collect_from_parens(part: Node, src: bytes, out: dict[str, Node]) -> None:
+        for sub in part.children:
+            if sub.type == "dotted_name":
+                nm = src[sub.start_byte:sub.end_byte].decode(errors="replace")
+                out.setdefault(nm, sub)
+            elif sub.type == "aliased_import":
+                alias = sub.child_by_field_name("alias")
+                target = alias if alias is not None else sub.child_by_field_name("name")
+                if target is not None:
+                    nm = src[target.start_byte:target.end_byte].decode(errors="replace")
+                    out.setdefault(nm, sub)
+
+    @staticmethod
+    def _bind_import_name(child: Node, src: bytes, out: dict[str, Node]) -> None:
+        """For `import x.y [as z]` children of an import_statement."""
+        if child.type == "dotted_name":
+            first = src[child.start_byte:child.end_byte].decode(errors="replace").split(".")[0]
+            out[first] = child
+        elif child.type == "aliased_import":
+            alias = child.child_by_field_name("alias")
+            target = alias if alias is not None else child.child_by_field_name("name")
+            if target is not None:
+                nm = src[target.start_byte:target.end_byte].decode(errors="replace")
+                out[nm] = child
+
+    # -- SG-AST-003 noise comments ---------------------------------------------
 
     def _noise_comments(self, root: Node, src: bytes, path: Path) -> list[Finding]:
         findings: list[Finding] = []
-        lines = src.decode("utf-8", errors="replace").splitlines()
-        for n in self._walk(root):
-            if n.type not in COMMENT_KINDS:
+        lines = src.decode(errors="replace").splitlines()
+        for node in self._walk(root):
+            if node.type not in COMMENT_KINDS:
                 continue
-            text = src[n.start_byte:n.end_byte].decode("utf-8", errors="replace")
-            body = re.sub(r"^(\s*#|/\*|\*+//)+", "", text).strip()
-            if not body or body.startswith(("type:", "noqa", "pylint", "pragma", "nosec")):
+            text = normalize_comment(src[node.start_byte:node.end_byte].decode(errors="replace"))
+            if len(text) < 4:
                 continue
-            if len(body) > 120:
-                continue  # long explanatory comments are fine
-            c_tokens = {t for t in normalize_comment(body).split()} - _COMMENT_FILLER
+            c_tokens = {t for t in re.split(r"\W+", text.lower()) if t} - _COMMENT_FILLER
             if not c_tokens:
                 continue
-            # compare with the following non-empty code line (typical placement)
-            idx = n.end_point[0]
-            target = None
-            for j in range(idx, min(idx + 2, len(lines))):
-                stripped = normalize_code(lines[j]) if j < len(lines) else ""
-                if stripped:
-                    target = stripped
-                    break
-            if target is None:
+            # compare against the following line, else the previous one
+            target_idx = None
+            for candidate in (node.end_point[0] + 1, node.start_point[0] - 1):
+                if 0 <= candidate < len(lines):
+                    norm = normalize_code(lines[candidate])
+                    if norm:
+                        target_idx = candidate
+                        break
+            if target_idx is None:
                 continue
-            k_tokens = {t for t in re.findall(r"[a-z0-9_]+", target.lower())}
-            if c_tokens and c_tokens <= k_tokens:
+            t_tokens = set(re.split(r"\W+", normalize_code(lines[target_idx]).lower())) - _COMMENT_FILLER
+            if c_tokens and c_tokens <= t_tokens:
                 findings.append(
                     Finding(
                         rule_id=RULE_NOISE_COMMENT,
-                        message=f"Comment `{body}` restates the adjacent code (AI noise comment).",
+                        message=(f"Comment merely restates the code: \"{text}\". "
+                                 "Explain *why*, not *what*."),
                         file=str(path),
-                        line=n.start_point[0] + 1,
-                        column=n.start_point[1] + 1,
+                        line=node.start_point[0] + 1,
+                        column=node.start_point[1] + 1,
                         severity=Severity.INFO,
                         confidence=0.75,
-                        suggested_fix="Delete the comment or explain *why*, not *what*.",
+                        suggested_fix="Delete the comment or document intent/edge cases instead.",
                         detector=self.name,
                     )
                 )
         return findings
 
-    # -- SG-AST-004: duplicated blocks (MinHash) --------------------------------
+    # -- SG-AST-001 stub functions ----------------------------------------------
 
-    def _duplicate_blocks(self, source: str, path: Path) -> list[Finding]:
-        cfg = self.config
-        # Build windows over *content* lines only (blank lines removed): AI
-        # clones are usually separated by blank lines and should still match.
-        content: list[tuple[int, str]] = [
-            (i, normalize_code(l)) for i, l in enumerate(source.splitlines())
-            if normalize_code(l)
-        ]
-        n = len(content)
-        win = cfg.duplicate_min_lines
-        if n < win * 2:
+    def _stub_functions(self, root: Node, src: bytes, path: Path) -> list[Finding]:
+        findings: list[Finding] = []
+        for node in self._walk(root):
+            if node.type not in ("function_definition",):
+                continue
+            body = node.child_by_field_name("body")
+            if body is None:
+                continue
+            body_text = src[body.start_byte:body.end_byte].decode(errors="replace").strip()
+            effective = [ln for ln in body_text.splitlines()
+                         if normalize_code(ln) and not normalize_comment(ln)]
+            trivial = all(normalize_code(ln).rstrip(":").strip().lower() in TRIVIAL_BODIES
+                          or not normalize_code(ln)
+                          for ln in body_text.splitlines())
+            if not trivial or len(effective) > self.config.stub_threshold:
+                continue
+            # look for TODO-ish marker in body or the preceding comment/docstring
+            doc = self._leading_context(node, src)
+            if not STUB_TODO_RE.search(body_text) and not STUB_TODO_RE.search(doc):
+                continue
+            fn_name_node = node.child_by_field_name("name")
+            fn_name = src[fn_name_node.start_byte:fn_name_node.end_byte].decode() if fn_name_node else "?"
+            findings.append(
+                Finding(
+                    rule_id=RULE_STUB_FUNCTION,
+                    message=f"`{fn_name}` looks like an unimplemented stub (TODO marker + trivial body).",
+                    file=str(path),
+                    line=node.start_point[0] + 1,
+                    column=node.start_point[1] + 1,
+                    end_line=node.end_point[0] + 1,
+                    severity=Severity.WARNING,
+                    confidence=0.9,
+                    suggested_fix=f"Implement `{fn_name}` or raise NotImplementedError explicitly with a tracking issue.",
+                    detector=self.name,
+                )
+            )
+        return findings
+
+    @staticmethod
+    def _leading_context(node: Node, src: bytes) -> str:
+        """Comments directly above a definition (heuristic for TODO placement)."""
+        lines = src.decode(errors="replace").splitlines()
+        start = node.start_point[0] - 1
+        ctx: list[str] = []
+        while start >= 0:
+            ln = lines[start].strip()
+            if ln.startswith("#"):
+                ctx.insert(0, ln)
+                start -= 1
+            elif not ln:
+                if ctx:
+                    break
+                start -= 1
+            else:
+                break
+        return "\n".join(ctx)
+
+    # -- SG-AST-004 duplicated blocks (near-clone detection) ---------------------
+
+    #: number of minhash slots; 16 slots give ±0.075 error which cannot
+    #: distinguish a 0.9 threshold — 64 slots reduce it to ~±0.04.
+    NUM_HASHES = 64
+    #: pairwise comparison cap before we bail to bucketing-only mode
+    MAX_WINDOWS_FOR_PAIRWISE = 2000
+
+    def _duplicated_blocks(self, path: Path, source: str) -> list[Finding]:
+        win = self.config.duplicate_min_lines
+        threshold = max(0.0, min(1.0, self.config.duplicate_similarity))
+        raw_lines = source.splitlines()
+        content: list[tuple[int, str]] = []  # (orig index, normalized line)
+        for idx, ln in enumerate(raw_lines):
+            norm = normalize_code(ln)
+            if norm and not normalize_comment(ln):
+                content.append((idx, norm))
+        if len(content) < win * 2:
             return []
-        blocks: dict[int, list[int]] = {}  # signature -> window start indices
-        for j in range(n - win + 1):
-            chunk = [t for _, t in content[j:j + win]]
-            shingles = self._shingles(chunk)
-            sig = self._minhash(shingles)
-            blocks.setdefault(sig, []).append(j)
+
+        # sliding windows over *normalized* lines
+        windows: list[tuple[int, tuple[str, ...], tuple[int, ...]]] = []
+        sigs: list[tuple[int, ...]] = []
+        step = max(1, win // 2)
+        for s in range(0, len(content) - win + 1, step):
+            chunk = content[s:s + win]
+            key = tuple(c for _, c in chunk)
+            if len(set(key)) < max(3, win // 2):   # too repetitive (blank-ish block)
+                continue
+            windows.append((chunk[0][0], key, tuple(ci for ci, _ in chunk)))
+            sigs.append(self._minhash_vector(self._shingles(list(key))))
+
         findings: list[Finding] = []
         reported: set[int] = set()
-        for sig, starts in blocks.items():
-            if len(starts) < 2:
-                continue
-            first_orig = content[starts[0]][0]
-            for s in starts[1:]:
-                orig_line = content[s][0]
+        n = len(windows)
+        if n > self.MAX_WINDOWS_FOR_PAIRWISE:
+            log.info("duplicate scan: %d windows > cap %d — grouping by exact "
+                     "signature only for this large file", n, self.MAX_WINDOWS_FOR_PAIRWISE)
+        # group candidate pairs cheaply: identical shingle-key first (exact dupes),
+        # then near-dupes via slot agreement within LSH-style bands.
+        seen_pairs: set[tuple[int, int]] = set()
+        for i in range(n):
+            for j in range(i + 1, n):
+                if windows[i][2][0] == windows[j][2][0]:
+                    continue
+                if abs(windows[i][0] - windows[j][0]) < win:
+                    continue  # overlapping windows
+                if windows[i][1] == windows[j][1]:
+                    sim = 1.0
+                elif n <= self.MAX_WINDOWS_FOR_PAIRWISE:
+                    agree = sum(1 for a, b in zip(sigs[i], sigs[j]) if a == b)
+                    sim = agree / self.NUM_HASHES
+                else:
+                    continue
+                if sim < threshold:
+                    continue
+                pair = (i, j)
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                orig_line, (first_orig) = windows[j][0], windows[i][0]
                 # avoid reporting overlapping windows repeatedly
                 if any(abs(orig_line - r) < win for r in reported):
                     continue
                 reported.add(orig_line)
-                snippet = content[s][1][:60]
+                snippet = windows[j][1][0][:60]
                 findings.append(
                     Finding(
                         rule_id=RULE_DUPLICATED_BLOCK,
                         message=(
                             f"Duplicated block of ≥{win} lines starting at line {orig_line + 1} "
-                            f"(identical to block at line {first_orig + 1}): `{snippet}…`"
+                            f"(~{sim:.0%} similar to block at line {first_orig + 1}): `{snippet}…`"
                         ),
                         file=str(path),
                         line=orig_line + 1,
                         end_line=orig_line + win,
                         severity=Severity.INFO,
-                        confidence=0.7,
+                        confidence=min(0.95, 0.5 + sim / 2),
                         suggested_fix="Extract the repeated logic into a helper function.",
                         detector=self.name,
                     )
@@ -354,19 +480,28 @@ class AstDetector:
             return {" ".join(toks)}
         return {" ".join(toks[i:i + k]) for i in range(len(toks) - k + 1)}
 
-    @staticmethod
-    def _minhash(shingles: set[str], num_hashes: int = 16) -> int:
-        """Compact MinHash signature (packed into one int for exact grouping)."""
-        vals = []
-        for seed in range(num_hashes):
-            best = None
-            for sh in shingles:
-                h = struct.unpack("<I", hashlib.md5(f"{seed}:{sh}".encode()).digest()[:4])[0]
-                if best is None or h < best:
+    @classmethod
+    def _minhash_vector(cls, shingles: set[str],
+                        num_hashes: Optional[int] = None) -> tuple[int, ...]:
+        """Full MinHash signature (one min-hash per permutation slot).
+
+        blake2b keyed hashing per seed; returns the vector itself — comparing
+        two vectors slot-wise estimates Jaccard similarity (≈ agreement rate).
+        """
+        nh = num_hashes or cls.NUM_HASHES
+        vals: list[int] = []
+        sh_list = list(shingles)
+        for seed in range(nh):
+            best = 0xFFFFFFFF
+            sb = struct.pack("<I", seed)
+            for sh in sh_list:
+                h = int.from_bytes(
+                    hashlib.blake2b(sh.encode(), key=sb, digest_size=4).digest(),
+                    "big")
+                if h < best:
                     best = h
-            vals.append(best if best is not None else 0xFFFFFFFF)
-        sig = b"".join(struct.pack("<I", v) for v in vals)
-        return int.from_bytes(hashlib.sha1(sig).digest()[:8], "big")
+            vals.append(best)
+        return tuple(vals)
 
     # -- utils -----------------------------------------------------------------
 
