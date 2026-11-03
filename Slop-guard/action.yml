@@ -1,0 +1,128 @@
+# Composite GitHub Action for slop-guard.
+#
+# IMPORTANT: GitHub only discovers `action.yml` at the *repository root*, so
+# this file lives next to the `slop-guard/` package directory and installs it
+# from source. Usage in a consumer workflow:
+#
+#   - uses: actions/checkout@v4
+#     with:
+#       fetch-depth: 0        # required for pr-mode (merge-base diff)
+#   - uses: gsait5270-lang/qwen-coder-env2@main
+#     with:
+#       fail-on: error
+#
+# Behaviour:
+#   1. installs the package (pinned version from PyPI once published, else ./slop-guard),
+#   2. scans (PR mode by default, SARIF always written),
+#   3. uploads SARIF to GitHub Code Scanning even when the gate fails,
+#   4. fails the job according to `fail-on`.
+
+name: slop-guard
+description: Detect AI slop & hallucinations (APIs, imports, stubs, phantom sources); upload SARIF and gate the job.
+author: slop-guard contributors
+
+branding:
+  icon: shield
+  color: purple
+
+inputs:
+  pr-mode:
+    description: Scan only files changed vs the PR base (requires fetch-depth 0).
+    required: false
+    default: "true"
+  fail-on:
+    description: Exit non-zero when a finding of this severity or higher exists (error|warning|info|never).
+    required: false
+    default: error
+  config:
+    description: Path to a .slop-guard.yaml (default: auto-discovered from the repo root upwards).
+    required: false
+    default: ""
+  target:
+    description: File or directory to scan.
+    required: false
+    default: "."
+  verify-sources:
+    description: Opt in to online DOI/arXiv verification (network egress to crossref.org / arxiv.org).
+    required: false
+    default: "false"
+  min-confidence:
+    description: Override the global reporting floor (0..1).
+    required: false
+    default: ""
+  python-version:
+    description: Python used to run the scanner.
+    required: false
+    default: "3.12"
+  install:
+    description: Pip requirement for slop-guard (default: the ./slop-guard directory of this action's checkout).
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install slop-guard
+      shell: bash
+      run: |
+        set -euo pipefail
+        REQ="${{ inputs.install }}"
+        if [ -z "$REQ" ]; then
+          # default: install from this action's own checkout (repo layout: slop-guard/)
+          REQ="${{ github.action_path }}/slop-guard"
+        fi
+        python -m pip install --quiet "$REQ"
+        slop-guard --version
+
+    - name: Scan
+      id: scan
+      shell: bash
+      run: |
+        set -uo pipefail
+        ARGS=(scan "${{ inputs.target }}"
+              --format sarif --output "${{ runner.temp }}/slop-guard.sarif"
+              --fail-on never)
+        if [ "${{ inputs.pr-mode }}" = "true" ] && [ -n "${{ github.base_ref }}" ]; then
+          git fetch --no-tags --depth=50 origin "${{ github.base_ref }}" || \
+            echo "::warning::could not fetch base ref '${{ github.base_ref }}'; scanning full tree"
+          if git rev-parse --verify --quiet "origin/${{ github.base_ref }}" >/dev/null; then
+            ARGS+=(--pr-mode --base-ref "origin/${{ github.base_ref }}")
+          fi
+        fi
+        [ -n "${{ inputs.config }}" ]         && ARGS+=(--config "${{ inputs.config }}")
+        [ "${{ inputs.verify-sources }}" = "true" ] && ARGS+=(--verify-sources)
+        [ -n "${{ inputs.min-confidence }}" ] && ARGS+=(--min-confidence "${{ inputs.min-confidence }}")
+        slop-guard "${ARGS[@]}"
+
+        # second pass for the gate (text output, real fail-on); SARIF file already written
+        GATE=(scan "${{ inputs.target }}" --fail-on "${{ inputs.fail-on }}")
+        if [ "${{ inputs.pr-mode }}" = "true" ] && [ -n "${{ github.base_ref }}" ] \
+           && git rev-parse --verify --quiet "origin/${{ github.base_ref }}" >/dev/null; then
+          GATE+=(--pr-mode --base-ref "origin/${{ github.base_ref }}")
+        fi
+        [ -n "${{ inputs.config }}" ] && GATE+=(--config "${{ inputs.config }}")
+        if slop-guard "${GATE[@]}"; then
+          echo "gate=pass" >> "$GITHUB_OUTPUT"
+        else
+          echo "gate=fail" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Upload SARIF to Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ runner.temp }}/slop-guard.sarif
+        category: slop-guard
+
+    - name: Gate
+      if: always()
+      shell: bash
+      run: |
+        if [ "${{ steps.scan.outputs.gate }}" = "fail" ]; then
+          echo "::error::slop-guard found issues at or above '${{ inputs.fail-on }}' severity"
+          exit 1
+        fi

@@ -1,0 +1,83 @@
+{
+  "package": "torch",
+  "version": "2.3.0",
+  "source": "generated from torch public API (verified subset)",
+  "members": {
+    "_any": [
+      "tensor",
+      "zeros",
+      "ones",
+      "randn",
+      "no_grad",
+      "nn",
+      "optim",
+      "cuda",
+      "save",
+      "load",
+      "cat",
+      "stack"
+    ],
+    "nn": [
+      "Linear",
+      "Conv2d",
+      "LSTM",
+      "Transformer",
+      "CrossEntropyLoss",
+      "MSELoss",
+      "functional",
+      "Module"
+    ],
+    "functional": [
+      "relu",
+      "softmax",
+      "cross_entropy",
+      "mse_loss",
+      "dropout",
+      "pad",
+      "one_hot"
+    ],
+    "F": [
+      "cross_entropy",
+      "dropout",
+      "elu",
+      "gelu",
+      "mse_loss",
+      "one_hot",
+      "pad",
+      "relu",
+      "sigmoid",
+      "silu",
+      "softmax",
+      "softplus",
+      "tanh"
+    ],
+    "nn.functional": [
+      "cross_entropy",
+      "dropout",
+      "elu",
+      "gelu",
+      "mse_loss",
+      "one_hot",
+      "pad",
+      "relu",
+      "sigmoid",
+      "silu",
+      "softmax",
+      "softplus",
+      "tanh"
+    ],
+    "Tensor": [
+      "numpy",
+      "cpu",
+      "cuda",
+      "to",
+      "item",
+      "detach",
+      "backward",
+      "view",
+      "reshape",
+      "size",
+      "dim"
+    ]
+  }
+}

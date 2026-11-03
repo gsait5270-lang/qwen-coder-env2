@@ -1,0 +1,30 @@
+{
+  "comment": "Ground truth for benchmarks/eval.py. `line` is 1-based. Every file must be fully labeled for the evaluated rules (an unlabeled finding counts as a false positive). Files marked requires_online are skipped unless eval.py runs with --verify-sources.",
+  "files": [
+    { "path": "good/clean_utils.py", "expect": [] },
+    { "path": "good/documented.py", "expect": [] },
+    {
+      "path": "bad/hallucinations.py",
+      "expect": [
+        { "rule": "SG-AST-002", "line": 4 },
+        { "rule": "SG-SEM-001", "line": 9 }
+      ]
+    },
+    {
+      "path": "bad/stubs_and_noise.py",
+      "expect": [
+        { "rule": "SG-AST-001", "line": 4 },
+        { "rule": "SG-AST-003", "line": 10 },
+        { "rule": "SG-AST-003", "line": 13 }
+      ]
+    },
+    {
+      "path": "bad/phantom_refs.md",
+      "requires_online": true,
+      "expect": [
+        { "rule": "SG-PRV-001", "line": 3 },
+        { "rule": "SG-PRV-001", "line": 3 }
+      ]
+    }
+  ]
+}
