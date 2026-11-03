@@ -1,0 +1,54 @@
+[project]
+name = "slop-guard"
+version = "0.1.0"
+description = "CI/CD detector for AI hallucinations and 'AI slop' in code and text (hallucinated APIs, dead imports, noise comments, stubs, phantom sources)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "slop-guard contributors" }]
+keywords = ["ai", "linting", "sarif", "github-action", "code-quality", "hallucination"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+  "typer>=0.12",
+  "PyYAML>=6.0",
+  "tree-sitter>=0.23",
+  "tree-sitter-language-pack>=0.7",
+  "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+semantic = [
+  "sentence-transformers>=3.0",   # cross-encoder comment/code similarity (module 2b)
+  "jedi>=0.19",                   # python symbol resolution
+]
+dev = [
+  "pytest>=8.0",
+  "hypothesis>=6.100",
+  "ruff>=0.5",
+]
+
+[project.scripts]
+slop-guard = "slop_guard.cli:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/slop_guard"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+src = ["src", "tests"]

@@ -1,0 +1,11 @@
+{
+  "package": "torch",
+  "version": "2.3.0",
+  "source": "generated from torch public API (verified subset)",
+  "members": {
+    "_any": ["tensor", "zeros", "ones", "randn", "no_grad", "nn", "optim", "cuda", "save", "load", "cat", "stack"],
+    "nn": ["Linear", "Conv2d", "LSTM", "Transformer", "CrossEntropyLoss", "MSELoss", "functional", "Module"],
+    "functional": ["relu", "softmax", "cross_entropy", "mse_loss", "dropout", "pad", "one_hot"],
+    "F": ["relu", "softmax", "cross_entropy", "mse_loss", "dropout", "pad", "one_hot"]
+  }
+}

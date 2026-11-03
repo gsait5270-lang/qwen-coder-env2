@@ -1,0 +1,14 @@
+{
+  "package": "pandas",
+  "version": "2.2.0",
+  "source": "generated from pandas public API (verified subset)",
+  "members": {
+    "_any": ["read_csv", "read_parquet", "concat", "merge", "DataFrame", "Series", "date_range", "to_datetime"],
+    "DataFrame": [
+      "head", "tail", "describe", "info", "groupby", "merge", "join", "sort_values",
+      "drop", "dropna", "fillna", "apply", "astype", "to_csv", "to_parquet", "to_json",
+      "to_sql", "to_excel", "reset_index", "set_index", "query", "filter", "assign",
+      "rename", "iterrows", "itertuples", "plot", "corr", "pivot_table", "rolling"
+    ]
+  }
+}
