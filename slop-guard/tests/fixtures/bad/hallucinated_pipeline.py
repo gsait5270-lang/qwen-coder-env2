@@ -2,13 +2,13 @@
 
 - SG-AST-002 dead import (torch.nn.functional as F)
 - SG-SEM-001 hallucinated API (df.to_parquet_s3)
-- SG-AST-003 noise comment (# increment i by 1)
+- SG-AST-003 noise comments (standalone AND trailing)
 - SG-AST-001 stub function (process_data with TODO + pass)
 - SG-PRV-001 phantom sources (fake DOI / fake arXiv id)
 """
 
 import pandas as pd
-import torch.nn.functional as F  # never used, left "just in case"
+import torch.nn.functional as F
 
 
 def load(path):
@@ -16,7 +16,8 @@ def load(path):
     df = pd.read_csv(path)
     # increment row count by one
     rows = len(df) + 1
-    result = df.to_parquet_s3("s3://bucket/key")  # method does not exist
+    result = df.to_parquet_s3("s3://bucket/key")
+    total = rows + 1  # add rows and one together
     return result
 
 

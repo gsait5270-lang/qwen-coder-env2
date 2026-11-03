@@ -172,12 +172,27 @@ def snapshot(
     typer.echo(f"wrote {path}")
 
 
-@app.version_option(__version__, prog_name="slop-guard")
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"slop-guard {__version__}")
+        raise typer.Exit(code=0)
 
 
-def main() -> None:
-    app()
+@app.callback()
+def _cli_callback(
+    version: Optional[bool] = typer.Option(
+        None, "--version", "-V", callback=_version_callback, is_eager=True,
+        help="Show version and exit.",
+    ),
+) -> None:
+    """Root callback — provides a Typer-native ``--version`` flag."""
+
+
+# Backwards-compatible aliases so both ``slop_guard.cli:cli`` (pyproject entry
+# point) and ``slop_guard.cli:main`` work after the refactor.
+cli = app
+main = app
 
 
 if __name__ == "__main__":  # pragma: no cover
-    main()
+    app()

@@ -172,15 +172,14 @@ class CachingChecker:
 
     def check(self, library: str, member: str, version: str = "") -> ExistenceAnswer:
         key = (library, member, version)
-        if key not in self._mem:
-            ans = self.inner.check(library, member, version)
-            # do not cache unknown answers — retry conditions may vanish later
-            self._mem[key] = ans if ans.exists is not None else None
-            if ans.exists is None:
-                return ans
-        cached = self._mem[key]
-        assert cached is not None
-        return cached
+        cached = self._mem.get(key)
+        if cached is not None:
+            return cached
+        ans = self.inner.check(library, member, version)
+        # do not cache unknown answers — retry conditions may vanish later
+        if ans.exists is not None:
+            self._mem[key] = ans
+        return ans
 
     def flush(self) -> None:
         if not self.cache_file:

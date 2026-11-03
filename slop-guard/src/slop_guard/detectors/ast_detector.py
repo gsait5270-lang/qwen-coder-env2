@@ -177,18 +177,15 @@ class AstDetector:
 
         # Re-export support: names listed in `__all__` (as strings) are used.
         exported = self._dunder_all_names(root, src)
-        # String annotations / doctests: any identifier appearing inside a
-        # string literal counts as potentially-used (conservative, kills the
-        # biggest FP class: `def f(x: "Thing")`).
-        in_strings = set()
-        for node in self._walk(root):
-            if node.type in ("string",):
-                text = src[node.start_byte:node.end_byte].decode(errors="replace")
-                in_strings.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text))
+        # String *annotations* count as usage (`def f(x: "Thing")`). We do NOT
+        # treat every identifier appearing in any string literal as used —
+        # that heuristic silenced dead imports whenever a docstring merely
+        # mentioned the name (regression on the bad fixture).
+        ann_strings = self._annotation_string_names(root, src)
 
         findings: list[Finding] = []
         for name, node in sorted(bound.items(), key=lambda kv: kv[1].start_byte):
-            if name in used or name in exported or name in in_strings:
+            if name in used or name in exported or name in ann_strings:
                 continue
             findings.append(
                 Finding(
@@ -205,6 +202,30 @@ class AstDetector:
                 )
             )
         return findings
+
+    #: AST node types whose *string children* are type annotations.
+    _ANNOTATION_HOSTS = {"type", "annotation"}
+
+    @classmethod
+    def _annotation_string_names(cls, root: Node, src: bytes) -> set[str]:
+        """Identifiers appearing inside string-literal annotations only.
+
+        ``def f(x: "Thing") -> "Other":`` and variable annotations like
+        ``items: list["Item"]`` mark those names as used; docstrings and
+        arbitrary strings do NOT (they caused false negatives for dead
+        imports).
+        """
+        out: set[str] = set()
+        for node in cls._walk(root):
+            if node.type not in cls._ANNOTATION_HOSTS:
+                continue
+            for s in cls._walk(node):
+                if s.type == "string":
+                    val = src[s.start_byte:s.end_byte].decode(errors="replace")
+                    # strip quotes so we don't match the literal prefix itself
+                    out.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]*",
+                                          re.sub(r"^[rbfRBFuU]*['\"]|['\"]$", "", val)))
+        return out
 
     @staticmethod
     def _dunder_all_names(root: Node, src: bytes) -> set[str]:
@@ -292,42 +313,63 @@ class AstDetector:
 
     def _noise_comments(self, root: Node, src: bytes, path: Path) -> list[Finding]:
         findings: list[Finding] = []
-        lines = src.decode(errors="replace").splitlines()
-        for node in self._walk(root):
-            if node.type not in COMMENT_KINDS:
-                continue
-            text = normalize_comment(src[node.start_byte:node.end_byte].decode(errors="replace"))
-            if len(text) < 4:
-                continue
-            c_tokens = {t for t in re.split(r"\W+", text.lower()) if t} - _COMMENT_FILLER
+        text_src = src.decode(errors="replace")
+        lines = text_src.splitlines()
+
+        def flag(comment_node: Node, comment_text: str, code_line_idx: int,
+                 code_text: str) -> None:
+            c_norm = normalize_comment(comment_text)
+            if len(c_norm) < 4:
+                return
+            c_tokens = {t for t in re.split(r"\W+", c_norm.lower()) if t} - _COMMENT_FILLER
             if not c_tokens:
-                continue
-            # compare against the following line, else the previous one
-            target_idx = None
-            for candidate in (node.end_point[0] + 1, node.start_point[0] - 1):
-                if 0 <= candidate < len(lines):
-                    norm = normalize_code(lines[candidate])
-                    if norm:
-                        target_idx = candidate
-                        break
-            if target_idx is None:
-                continue
-            t_tokens = set(re.split(r"\W+", normalize_code(lines[target_idx]).lower())) - _COMMENT_FILLER
+                return
+            t_tokens = set(re.split(r"\W+", normalize_code(code_text).lower())) - _COMMENT_FILLER
             if c_tokens and c_tokens <= t_tokens:
                 findings.append(
                     Finding(
                         rule_id=RULE_NOISE_COMMENT,
-                        message=(f"Comment merely restates the code: \"{text}\". "
+                        message=(f"Comment merely restates the code: \"{c_norm}\". "
                                  "Explain *why*, not *what*."),
                         file=str(path),
-                        line=node.start_point[0] + 1,
-                        column=node.start_point[1] + 1,
+                        line=comment_node.start_point[0] + 1,
+                        column=comment_node.start_point[1] + 1,
                         severity=Severity.INFO,
                         confidence=0.75,
                         suggested_fix="Delete the comment or document intent/edge cases instead.",
                         detector=self.name,
                     )
                 )
+
+        # (a) standalone comments — compare against next non-blank line, else prev
+        for node in self._walk(root):
+            if node.type not in COMMENT_KINDS:
+                continue
+            text = src[node.start_byte:node.end_byte].decode(errors="replace")
+            target_idx = None
+            for candidate in (node.end_point[0] + 1, node.start_point[0] - 1):
+                if 0 <= candidate < len(lines):
+                    norm = normalize_code(lines[candidate])
+                    if norm and "#" not in norm:   # not a trailing-comment line
+                        target_idx = candidate
+                        break
+            if target_idx is None:
+                continue
+            flag(node, text, target_idx, lines[target_idx])
+
+        # (b) trailing comments: `i += 1  # increment i by 1` — tree-sitter
+        # attaches these inside the statement; compare with the SAME line's
+        # code portion only (previous regression: same-line pairs were missed).
+        for node in self._walk(root):
+            if node.type != "comment":
+                continue
+            row = node.start_point[0]
+            raw = lines[row] if 0 <= row < len(lines) else ""
+            before = raw[:node.start_point[1]]
+            after = raw[node.end_point[1]:]
+            if before.strip() and not after.strip():     # genuine trailing comment
+                flag(node, src[node.start_byte:node.end_byte].decode(errors="replace"),
+                     row, before)
         return findings
 
     # -- SG-AST-001 stub functions ----------------------------------------------
@@ -409,11 +451,13 @@ class AstDetector:
         if len(content) < win * 2:
             return []
 
-        # sliding windows over *normalized* lines
+        # sliding windows over *normalized* lines.
+        # step=1 (was win//2): with a stride, two aligned clones starting at
+        # offsets not divisible by the stride never produce comparable windows;
+        # unit stride guarantees every clone pair shares an aligned window.
         windows: list[tuple[int, tuple[str, ...], tuple[int, ...]]] = []
         sigs: list[tuple[int, ...]] = []
-        step = max(1, win // 2)
-        for s in range(0, len(content) - win + 1, step):
+        for s in range(0, len(content) - win + 1):
             chunk = content[s:s + win]
             key = tuple(c for _, c in chunk)
             if len(set(key)) < max(3, win // 2):   # too repetitive (blank-ish block)

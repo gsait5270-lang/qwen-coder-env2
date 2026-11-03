@@ -269,7 +269,14 @@ class ProvenanceDetector:
     # -- HTTP implementations ----------------------------------------------------
 
     def _client(self) -> httpx.Client:
-        headers = {"User-Agent": "slop-guard/0.3 (+https://github.com/slop-guard)"}
+        from .. import __version__
+
+        headers = {
+            "User-Agent": (
+                f"slop-guard/{__version__} "
+                "(https://github.com/slop-guard/slop-guard)"
+            )
+        }
         return httpx.Client(timeout=self.config.timeout,
                             follow_redirects=True, headers=headers)
 
@@ -317,6 +324,7 @@ class ProvenanceDetector:
         """One query for N ids: id_list=a,b,c. Entries missing from the feed
         response are phantoms; transport failure marks the whole batch
         UNVERIFIABLE."""
+        out: dict[str, ResolveStatus] = {}
         for attempt in range(self.config.retries + 1):
             try:
                 with self._client() as c:

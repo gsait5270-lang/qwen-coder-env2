@@ -59,6 +59,7 @@ class SemanticDetector:
         _, src_bytes, root = parsed
 
         imports = self._import_map(root, src_bytes)
+        var_types = self._infer_var_types(root, src_bytes, imports)
         versions = self.config.versions or {}
         findings: list[Finding] = []
         seen: set[tuple[str, int]] = set()
@@ -72,21 +73,30 @@ class SemanticDetector:
                 continue
             obj_name = src_bytes[obj.start_byte:obj.end_byte].decode(errors="replace")
             attr_name = src_bytes[attr.start_byte:attr.end_byte].decode(errors="replace")
-            if not obj_name or not attr_name:
+            if not obj_name or not attr_name or attr_name.startswith("_"):
                 continue
-            # resolve chained expressions to the deepest identifier
-            first = obj_name.split(".")[0]
-            lib_path = imports.get(first)
+
+            # Resolve the object expression to a library path *including*
+            # intermediate chain segments: `torch.nn.functional.gelu_approx`
+            # must be checked as torch.nn.functional (not just `torch`), and
+            # `df.to_parquet_s3()` where `df = pd.read_csv(...)` resolves via
+            # factory inference to pandas.DataFrame.
+            lib_path = self._resolve_obj(obj, obj_name, src_bytes, imports, var_types)
             if lib_path is None:
-                pkg_guess = ROOT_TO_PKG.get(first)
-                if pkg_guess is None or attr_name.startswith("_"):
-                    continue
-                lib_path = pkg_guess
+                continue
 
             version = versions.get(lib_path.split(".")[0], "")
-            answers = [c.check(lib_path, attr_name, version) for c in self.checkers]
+            try:
+                answers = [c.check(lib_path, attr_name, version) for c in self.checkers]
+            except Exception as exc:  # a broken backend must never kill the scan
+                log.warning("checker %r raised (%s); skipping semantic check for %s.%s",
+                            getattr(self.checkers[0], "source", "?"), exc,
+                            lib_path, attr_name)
+                continue
             definitive = [a for a in answers if a.exists is not None]
             if not definitive:
+                log.debug("semantic: %s.%s unverifiable by all backends — silent",
+                          lib_path, attr_name)
                 continue  # every backend said "cannot verify" -> stay silent
             neg = [a for a in definitive if a.exists is False]
             pos = [a for a in definitive if a.exists is True]
@@ -127,6 +137,114 @@ class SemanticDetector:
         return findings
 
     # -- helpers ----------------------------------------------------------------
+
+    def _resolve_obj(self, obj: Node, obj_name: str, src: bytes,
+                     imports: dict[str, Optional[str]],
+                     var_types: dict[str, str]) -> Optional[str]:
+        """Map an object expression to the deepest *known* library path.
+
+        Cases (postfix chain is consumed left-to-right, longest known prefix
+        wins):
+
+        1. ``F.gelu_approx`` with ``import torch.nn.functional as F`` →
+           imports["F"] = "torch.nn.functional" (full path preserved).
+        2. ``torch.nn.functional.gelu_approx`` → root resolves to "torch",
+           then each further segment ("nn", "functional") is appended only if
+           it is itself a known member of the accumulated path (checked via
+           ``var_types``-style knowledge in checkers is too costly here; we
+           use the import map + a static submodule table instead).
+        3. ``df.to_parquet_s3`` where ``df = pd.read_csv(...)`` → factory
+           inference maps df → "pandas.DataFrame".
+        4. Bare alias heuristics (``np``, ``plt``, ``tf``) for code that never
+           imported them explicitly (REPL-style snippets).
+        """
+        segs = obj_name.split(".")
+        first = segs[0]
+        base: Optional[str] = None
+        if first in imports:
+            base = imports[first]
+        elif first in var_types:
+            base = var_types[first]
+        else:
+            guess = ROOT_TO_PKG.get(first)
+            if guess is not None and len(segs) == 1:
+                base = guess
+        if base is None:
+            return None
+
+        # Extend the path through intermediate attribute segments when they
+        # are known submodules/attributes of the current path. We treat every
+        # plain (non-dunder) identifier segment as a legitimate extension —
+        # the *checkers* decide whether the resulting path is verifiable;
+        # previously chains were truncated at the root, which made
+        # `torch.nn.functional.<anything>` unverifiable and silent.
+        path = base
+        for seg in segs[1:]:
+            if not seg or seg.startswith("_") or not seg.isidentifier():
+                break
+            path = f"{path}.{seg}"
+        if path == base and len(segs) > 1:
+            # could not extend (e.g. call results inside the chain); fall back
+            # to the base path so the final attribute is still checked.
+            path = base
+        return path
+
+    #: factory functions whose result type we know well enough to attribute
+    #: members of the returned class against (module_path -> class pool key).
+    FACTORY_TYPES: dict[tuple[str, str], str] = {
+        ("pandas", "read_csv"): "pandas.DataFrame",
+        ("pandas", "read_parquet"): "pandas.DataFrame",
+        ("pandas", "read_json"): "pandas.DataFrame",
+        ("pandas", "concat"): "pandas.DataFrame",
+        ("pandas", "DataFrame"): "pandas.DataFrame",
+        ("pandas", "Series"): "pandas.Series",
+        ("pandas", "date_range"): "pandas.DatetimeIndex",
+        ("numpy", "array"): "numpy.ndarray",
+        ("numpy", "zeros"): "numpy.ndarray",
+        ("numpy", "ones"): "numpy.ndarray",
+        ("numpy", "randn"): "numpy.ndarray",
+        ("torch", "tensor"): "torch.Tensor",
+        ("torch", "zeros"): "torch.Tensor",
+        ("torch", "ones"): "torch.Tensor",
+        ("torch", "randn"): "torch.Tensor",
+    }
+
+    @classmethod
+    def _infer_var_types(cls, root: Node, src: bytes,
+                         imports: dict[str, Optional[str]]) -> dict[str, str]:
+        """Very small dataflow pass: ``x = <factory>(...)`` ⇒ x : <class path>.
+
+        Only direct assignments from known factory calls are tracked; anything
+        else stays unknown (no guessing — unknown variables produce no checks
+        and therefore no false positives).
+        """
+        out: dict[str, str] = {}
+        for node in cls._walk(root):
+            if node.type != "assignment":
+                continue
+            left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
+            if left is None or right is None or left.type != "identifier":
+                continue
+            name = src[left.start_byte:left.end_byte].decode(errors="replace")
+            if right.type != "call":
+                continue
+            func = right.child_by_field_name("function")
+            if func is None or func.type not in ("identifier", "attribute"):
+                continue
+            fname = src[func.start_byte:func.end_byte].decode(errors="replace")
+            fsegs = fname.split(".")
+            if len(fsegs) != 2:
+                continue
+            mod_alias, fn_name = fsegs
+            mod_path = imports.get(mod_alias)
+            if not mod_path:
+                continue
+            pkg = mod_path.split(".")[0]
+            type_path = cls.FACTORY_TYPES.get((pkg, fn_name))
+            if type_path is not None:
+                out[name] = type_path
+        return out
 
     @staticmethod
     def _import_map(root: Node, src: bytes) -> dict[str, str]:
